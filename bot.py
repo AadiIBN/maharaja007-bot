@@ -477,11 +477,17 @@ async def cmd_exportxlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ws_sub.append([r["id"], r["tg_user_id"], r["broker"], r["client_id"], r["screenshot_file_id"], r["status"], r["created_at"], r["updated_at"]])
 
     wb.save(xlsx_path)
-    try:
-        await context.bot.send_document(update.effective_chat.id, InputFile(xlsx_path))
-    except Exception as e:
-        return await update.message.reply_text(f"Export failed: {e}")
-    await update.message.reply_text("Excel export sent ✅")
+try:
+    # Proper filename + MIME hint so Telegram shows it as a real Excel file
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=InputFile(xlsx_path, filename="export_maharaja.xlsx"),
+        filename="export_maharaja.xlsx",
+    )
+except Exception as e:
+    return await update.message.reply_text(f"Export failed: {e}")
+await update.message.reply_text("Excel export sent ✅")
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
@@ -528,3 +534,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
