@@ -7,6 +7,7 @@ import time
 import sqlite3
 import asyncio
 from typing import Optional
+from io import BytesIO
 
 from openpyxl import Workbook
 from telegram import (
@@ -193,7 +194,6 @@ def _botcommands_list(is_admin_flag: bool):
     return cmds
 
 async def set_chat_commands(context: ContextTypes.DEFAULT_TYPE, chat_id: int, is_admin_flag: bool):
-    """Set / menu commands for this chat (admin gets extra commands)."""
     try:
         await context.bot.set_my_commands(_botcommands_list(is_admin_flag), scope=BotCommandScopeChat(chat_id))
     except Exception:
@@ -204,11 +204,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     chat_id = update.effective_chat.id
 
-    # ban check
     if is_banned(u.id):
         return await (update.message or update.callback_query.message).reply_text("You are banned from using this bot.")
 
-    # upsert user
     with db() as con:
         con.execute(
             "INSERT INTO users (tg_user_id, username, first_name, last_name) VALUES (?,?,?,?) "
@@ -217,7 +215,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         con.commit()
 
-    # update slash menu for this chat
     await set_chat_commands(context, chat_id, is_admin(u.id))
 
     await show_typing(context, chat_id, 0.4)
@@ -495,12 +492,13 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
     await update.message.reply_text(f"📢 Broadcast finished. Sent: {sent} | Failed: {failed}")
 
-# --- Excel Export ---
+# --- Excel Export (in-memory, no temp file) ---
 async def cmd_exportxlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return await update.message.reply_text("You are not authorized.")
-    xlsx_path = "export_maharaja.xlsx"
+
     wb = Workbook()
+
     ws_users = wb.active
     ws_users.title = "users"
     ws_users.append(["tg_user_id", "username", "first_name", "last_name", "joined_at", "last_submit_ts"])
@@ -509,21 +507,36 @@ async def cmd_exportxlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ws_sub.append(["id", "tg_user_id", "broker", "client_id", "screenshot_file_id", "status", "created_at", "updated_at"])
 
     with db() as con:
-        for r in con.execute("SELECT tg_user_id, username, first_name, last_name, joined_at, last_submit_ts FROM users ORDER BY joined_at"):
-            ws_users.append([r["tg_user_id"], r["username"], r["first_name"], r["last_name"], r["joined_at"], r["last_submit_ts"]])
-        for r in con.execute("SELECT id, tg_user_id, broker, client_id, screenshot_file_id, status, created_at, updated_at FROM submissions ORDER BY created_at DESC"):
-            ws_sub.append([r["id"], r["tg_user_id"], r["broker"], r["client_id"], r["screenshot_file_id"], r["status"], r["created_at"], r["updated_at"]])
+        for r in con.execute(
+            "SELECT tg_user_id, username, first_name, last_name, joined_at, last_submit_ts FROM users ORDER BY joined_at"
+        ):
+            ws_users.append([
+                r["tg_user_id"], r["username"], r["first_name"], r["last_name"], r["joined_at"], r["last_submit_ts"]
+            ])
+        for r in con.execute(
+            "SELECT id, tg_user_id, broker, client_id, screenshot_file_id, status, created_at, updated_at "
+            "FROM submissions ORDER BY created_at DESC"
+        ):
+            ws_sub.append([
+                r["id"], r["tg_user_id"], r["broker"], r["client_id"], r["screenshot_file_id"],
+                r["status"], r["created_at"], r["updated_at"]
+            ])
 
-    wb.save(xlsx_path)
+    # Save to memory (BytesIO) so no corrupt/partial file issues
+    bio = BytesIO()
+    wb.save(bio)
+    wb.close()
+    bio.seek(0)
+
     try:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
-            document=InputFile(xlsx_path, filename="export_maharaja.xlsx"),
+            document=InputFile(bio, filename="export_maharaja.xlsx"),
             filename="export_maharaja.xlsx",
+            caption="✅ Excel export generated",
         )
     except Exception as e:
         return await update.message.reply_text(f"Export failed: {e}")
-    await update.message.reply_text("Excel export sent ✅")
 
 # --- HELP & REFRESH ---
 def _help_text(is_admin_flag: bool) -> str:
@@ -539,7 +552,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_help_text(flag))
 
 async def cmd_refreshcommands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: refreshes the slash menu for this chat."""
     if not is_admin(update.effective_user.id):
         return await update.message.reply_text("You are not authorized.")
     await set_chat_commands(context, update.effective_chat.id, True)
