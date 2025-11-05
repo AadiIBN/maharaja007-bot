@@ -4,10 +4,9 @@
 import os
 import re
 import time
-import csv
 import sqlite3
 import asyncio
-from typing import Optional, List
+from typing import Optional
 
 from openpyxl import Workbook
 from telegram import (
@@ -18,6 +17,8 @@ from telegram import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     InputFile,
+    BotCommand,
+    BotCommandScopeChat,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -40,6 +41,26 @@ COOLDOWN_SECONDS = 120
 # If True -> user jaisi hi kahin bhi approved ho, phir kisi broker pe dubara request na kar sake (global lock)
 ONE_TIME_VERIFICATION = False
 
+# ---- Commands list (for / menu & /help) ----
+USER_COMMANDS = [
+    ("start", "Start verification flow"),
+    ("help", "Show help / command list"),
+    ("cancel", "Cancel current step"),
+]
+ADMIN_COMMANDS = [
+    ("setgroup", "Set VIP link: /setgroup <broker> <invite_link>"),
+    ("brokers", "List brokers & VIP links"),
+    ("users", "Show users summary"),
+    ("pending", "List pending submissions"),
+    ("find", "Find by user_id or client_id: /find <key>"),
+    ("stats", "Show stats"),
+    ("ban", "Ban a user: /ban <user_id> [reason]"),
+    ("unban", "Unban a user: /unban <user_id>"),
+    ("broadcast", "Broadcast to all users: /broadcast <message>"),
+    ("exportxlsx", "Export Excel (users + submissions)"),
+    ("refreshcommands", "Refresh slash menu in this chat"),
+]
+
 # ---------------- DB ----------------
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -59,7 +80,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   broker TEXT NOT NULL,
   client_id TEXT NOT NULL,
   screenshot_file_id TEXT,
-  status TEXT NOT NULL DEFAULT 'pending', -- pending|approved|rejected
+  status TEXT NOT NULL DEFAULT 'pending',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -164,13 +185,30 @@ def normalize_client_id(broker: str, cid: str) -> Optional[str]:
         return cid if re.fullmatch(r"[A-Za-z0-9_-]{5,16}", cid) else None
     return cid
 
+# ---- slash menu updater ----
+def _botcommands_list(is_admin_flag: bool):
+    cmds = [BotCommand(n, d) for n, d in USER_COMMANDS]
+    if is_admin_flag:
+        cmds += [BotCommand(n, d) for n, d in ADMIN_COMMANDS]
+    return cmds
+
+async def set_chat_commands(context: ContextTypes.DEFAULT_TYPE, chat_id: int, is_admin_flag: bool):
+    """Set / menu commands for this chat (admin gets extra commands)."""
+    try:
+        await context.bot.set_my_commands(_botcommands_list(is_admin_flag), scope=BotCommandScopeChat(chat_id))
+    except Exception:
+        pass
+
 # ---------------- USER FLOW ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    chat_id = update.effective_chat.id
+
     # ban check
     if is_banned(u.id):
         return await (update.message or update.callback_query.message).reply_text("You are banned from using this bot.")
 
+    # upsert user
     with db() as con:
         con.execute(
             "INSERT INTO users (tg_user_id, username, first_name, last_name) VALUES (?,?,?,?) "
@@ -179,7 +217,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         con.commit()
 
-    await show_typing(context, update.effective_chat.id, 0.4)
+    # update slash menu for this chat
+    await set_chat_commands(context, chat_id, is_admin(u.id))
+
+    await show_typing(context, chat_id, 0.4)
     await (update.message or update.callback_query.message).reply_text(
         "Choose your Forex broker:", reply_markup=broker_keyboard()
     )
@@ -195,12 +236,11 @@ async def on_broker_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(u.id):
         return await q.message.reply_text("You are banned from using this bot.")
 
-    # lock checks
     if user_has_approved(u.id, broker):
         if ONE_TIME_VERIFICATION:
             return await q.message.reply_text("You are already verified. Further requests are not allowed.")
         return await q.message.reply_text(f"You are already verified for {broker}. You cannot resubmit.")
-    # pending?
+
     with db() as con:
         row = con.execute(
             "SELECT 1 FROM submissions WHERE tg_user_id=? AND broker=? AND status='pending'",
@@ -232,7 +272,6 @@ async def on_client_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Invalid Client ID for {broker}. {examples.get(broker,'')}\nPlease enter again:"
         )
 
-    # cooldown
     with db() as con:
         row = con.execute("SELECT last_submit_ts FROM users WHERE tg_user_id=?", (update.effective_user.id,)).fetchone()
     now = int(time.time())
@@ -264,7 +303,6 @@ async def on_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client_id = context.user_data.get("client_id")
     user = update.effective_user
 
-    # final double-check
     if user_has_approved(user.id, broker):
         if ONE_TIME_VERIFICATION:
             return await update.message.reply_text("You are already verified. Further requests are not allowed.")
@@ -447,12 +485,12 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = con.execute("SELECT tg_user_id FROM users ORDER BY tg_user_id").fetchall()
     for r in rows:
         uid = r["tg_user_id"]
-        if is_banned(uid):  # skip banned
+        if is_banned(uid):
             continue
         try:
             await context.bot.send_message(uid, message)
             sent += 1
-            await asyncio.sleep(0.03)  # be gentle to Telegram
+            await asyncio.sleep(0.03)
         except Exception:
             failed += 1
     await update.message.reply_text(f"📢 Broadcast finished. Sent: {sent} | Failed: {failed}")
@@ -477,17 +515,35 @@ async def cmd_exportxlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ws_sub.append([r["id"], r["tg_user_id"], r["broker"], r["client_id"], r["screenshot_file_id"], r["status"], r["created_at"], r["updated_at"]])
 
     wb.save(xlsx_path)
-try:
-    # Proper filename + MIME hint so Telegram shows it as a real Excel file
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=InputFile(xlsx_path, filename="export_maharaja.xlsx"),
-        filename="export_maharaja.xlsx",
-    )
-except Exception as e:
-    return await update.message.reply_text(f"Export failed: {e}")
-await update.message.reply_text("Excel export sent ✅")
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=InputFile(xlsx_path, filename="export_maharaja.xlsx"),
+            filename="export_maharaja.xlsx",
+        )
+    except Exception as e:
+        return await update.message.reply_text(f"Export failed: {e}")
+    await update.message.reply_text("Excel export sent ✅")
 
+# --- HELP & REFRESH ---
+def _help_text(is_admin_flag: bool) -> str:
+    u_lines = [f"/{n} — {d}" for n, d in USER_COMMANDS]
+    txt = "🟩 User Commands:\n" + "\n".join(u_lines)
+    if is_admin_flag:
+        a_lines = [f"/{n} — {d}" for n, d in ADMIN_COMMANDS]
+        txt += "\n\n🟥 Admin Commands:\n" + "\n".join(a_lines)
+    return txt
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    flag = is_admin(update.effective_user.id)
+    await update.message.reply_text(_help_text(flag))
+
+async def cmd_refreshcommands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: refreshes the slash menu for this chat."""
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("You are not authorized.")
+    await set_chat_commands(context, update.effective_chat.id, True)
+    await update.message.reply_text("Slash menu updated for this chat ✅")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
@@ -529,9 +585,12 @@ def main():
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("exportxlsx", cmd_exportxlsx))
 
+    # Help + menu refresh
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("refreshcommands", cmd_refreshcommands))
+
     print("Bot maharaja007 is running…")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
