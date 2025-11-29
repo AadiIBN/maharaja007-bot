@@ -1,5 +1,5 @@
-# bot.py — Optimized for High Load (20k+ Users) + Render Fix
-# Python 3.10+ | python-telegram-bot 21.x | aiosqlite
+# bot.py — Verified Users Only for AI + Render Fix (English Version)
+# Python 3.10+ | python-telegram-bot 21.x | aiosqlite | google-generativeai
 
 import os
 import re
@@ -11,6 +11,7 @@ import threading
 import aiosqlite
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
+from io import BytesIO
 
 from telegram import (
     Update,
@@ -19,7 +20,6 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    InputFile,
     BotCommand,
     BotCommandScopeChat,
 )
@@ -33,7 +33,10 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import Forbidden, BadRequest
+from telegram.error import Forbidden
+
+# --- IMPORT AI MODULE ---
+from ssm_ai import analyze_ssm_request
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -45,6 +48,7 @@ logger = logging.getLogger(__name__)
 BROKERS = ["Exness", "IC Markets", "FBS"]
 DB_PATH = "maharaja_bot.db"
 
+# Conversation States
 CHOOSE_BROKER, ASK_CLIENT_ID, ASK_SCREENSHOT = range(3)
 COOLDOWN_SECONDS = 120
 ONE_TIME_VERIFICATION = False
@@ -53,7 +57,7 @@ ONE_TIME_VERIFICATION = False
 USER_COMMANDS = [
     ("start", "Start verification flow"),
     ("help", "Show help / command list"),
-    ("cancel", "Cancel current step"),
+    ("cancel", "Cancel verification"),
 ]
 ADMIN_COMMANDS = [
     ("setgroup", "Set VIP link: /setgroup <broker> <link>"),
@@ -69,8 +73,7 @@ ADMIN_COMMANDS = [
     ("refreshcommands", "Refresh menu"),
 ]
 
-# ---------------- RENDER KEEP-ALIVE (IMPORTANT) ----------------
-# This Dummy Server prevents Render from killing the bot
+# ---------------- RENDER KEEP-ALIVE ----------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -78,7 +81,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is alive and running!")
 
 def start_web_server():
-    # Render provides PORT env variable, default to 10000
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     print(f"🌍 Dummy Web Server started on port {port}")
@@ -142,6 +144,12 @@ async def is_banned(user_id: int) -> bool:
         async with db.execute("SELECT 1 FROM bans WHERE tg_user_id=?", (user_id,)) as cursor:
             return bool(await cursor.fetchone())
 
+# Check if user is verified (Has ANY approved submission)
+async def is_verified_user(user_id: int) -> bool:
+    async with get_db() as db:
+        async with db.execute("SELECT 1 FROM submissions WHERE tg_user_id=? AND status='approved' LIMIT 1", (user_id,)) as cursor:
+            return bool(await cursor.fetchone())
+
 def broker_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(b, callback_data=f"broker:{b}")] for b in BROKERS])
 
@@ -181,10 +189,27 @@ async def send_vip_link(ctx: ContextTypes.DEFAULT_TYPE, user_id: int, broker: st
             row = await cursor.fetchone()
             if row: link = row["invite_link"]
     
+    # --- UPDATED SUCCESS MESSAGE (ENGLISH) ---
     if link:
-        msg = f"🎉 *Congratulations! You are verified.*\nBroker: {broker}\n\n[Join VIP Channel]({link})"
+        msg = (
+            f"🎉 *Congratulations! You are verified.*\n"
+            f"Broker: {broker}\n\n"
+            f"✅ **VIP Access Granted:**\n"
+            f"[Join VIP Channel]({link})\n\n"
+            f"🔓 **BONUS UNLOCKED:**\n"
+            f"**Shaakuni AI Mentor** is now active! 🤖\n"
+            f"You can send me any **Chart (Photo)** or **Question**, and I will analyze it using deep SSM logic.\n\n"
+            f"Try it now: Send a chart!"
+        )
     else:
-        msg = f"🎉 *Congratulations! You are verified.*\nBroker: {broker}\n\n(VIP link is being updated by Admin. Please wait.)"
+        msg = (
+            f"🎉 *Congratulations! You are verified.*\n"
+            f"Broker: {broker}\n\n"
+            f"(VIP link is being updated by admin. Please wait.)\n\n"
+            f"🔓 **BONUS UNLOCKED:**\n"
+            f"**Shaakuni AI Mentor** is now active!\n"
+            f"You can start sending charts for analysis."
+        )
     
     try:
         await ctx.bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN)
@@ -200,7 +225,7 @@ def normalize_client_id(broker: str, cid: str) -> Optional[str]:
         return cid if re.fullmatch(r"[A-Za-z0-9_-]{5,16}", cid) else None
     return cid
 
-# ---------------- USER FLOW ----------------
+# ---------------- USER FLOW (VERIFICATION) ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     chat_id = update.effective_chat.id
@@ -318,6 +343,75 @@ async def on_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
+# ---------------- NEW AI MENTOR HANDLER (LOCKED FOR NON-VERIFIED) ----------------
+async def handle_mentorship(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles Photos (Charts) and Text questions.
+    LOCKS feature if user is not verified.
+    """
+    u = update.effective_user
+    if await is_banned(u.id): return
+
+    # --- 1. CHECK VERIFICATION STATUS ---
+    is_verified = await is_verified_user(u.id)
+
+    if not is_verified:
+        # USER NOT VERIFIED -> REJECT REQUEST (ENGLISH)
+        msg = (
+            "🔒 **Premium Feature Locked**\n\n"
+            "Sorry, **Shaakuni AI Mentor** is exclusively for verified VIP members.\n\n"
+            "👉 **How to unlock?**\n"
+            "1. Tap /start.\n"
+            "2. Select your Broker and verify your account.\n"
+            "3. Once approved by Admin, this feature will unlock automatically."
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # --- 2. USER IS VERIFIED -> PROCEED WITH AI ---
+    # Check if we have a photo or text
+    image_bytes = None
+    user_text = update.message.caption or update.message.text
+
+    # Notify user we are thinking (English)
+    status_msg = await update.message.reply_text("🧠 Analyzing Shaakuni Strategy... Please wait.")
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+
+    try:
+        # If user sent a photo
+        if update.message.photo:
+            photo_file = await update.message.photo[-1].get_file()
+            # Download to memory
+            image_stream = BytesIO()
+            await photo_file.download_to_memory(image_stream)
+            image_bytes = image_stream.getvalue()
+        
+        # Call AI
+        response = await analyze_ssm_request(user_text, image_bytes)
+
+        # Reply (Use Markdown for formatting)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_msg.message_id,
+                text=response,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            # Fallback if Markdown fails
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_msg.message_id,
+                text=response
+            )
+
+    except Exception as e:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_msg.message_id,
+            text=f"❌ Error during analysis: {str(e)}"
+        )
+
 # ---------------- ADMIN ACTIONS ----------------
 async def on_decide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -338,6 +432,7 @@ async def on_decide(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db.execute("UPDATE submissions SET status='approved', updated_at=CURRENT_TIMESTAMP WHERE id=?", (sid,))
             await db.commit()
             await q.edit_message_text(f"✅ Approved #{sid} (User notified).")
+            # Send VIP link + Unlock Notification
             await send_vip_link(context, sub["tg_user_id"], sub["broker"])
         else:
             await db.execute("UPDATE submissions SET status='rejected', updated_at=CURRENT_TIMESTAMP WHERE id=?", (sid,))
@@ -427,6 +522,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
 
+    # 1. Verification Conversation (Iska priority high hona chahiye)
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -436,15 +532,20 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     app.add_handler(conv)
+
+    # 2. Admin Handlers
     app.add_handler(CallbackQueryHandler(on_decide, pattern=r"^(approve|reject):"))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("exportcsv", cmd_exportcsv))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
 
-    print("✅ Bot is running with Render Fix...")
+    # 3. AI MENTOR HANDLER (Lowest Priority - For random chats/photos)
+    # Ye handler tabhi chalega jab upar wala Conversation active nahi hoga
+    app.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), handle_mentorship))
+
+    print("✅ Bot is running with Shaakuni AI (Verified Only Mode)...")
     app.run_polling()
 
 if __name__ == "__main__":
