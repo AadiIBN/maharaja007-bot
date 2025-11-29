@@ -1,4 +1,4 @@
-# bot.py — Optimized for High Load (20k+ Users)
+# bot.py — Optimized for High Load (20k+ Users) + Render Fix
 # Python 3.10+ | python-telegram-bot 21.x | aiosqlite
 
 import os
@@ -7,7 +7,9 @@ import time
 import asyncio
 import logging
 import csv
+import threading
 import aiosqlite
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 from telegram import (
@@ -33,7 +35,7 @@ from telegram.ext import (
 )
 from telegram.error import Forbidden, BadRequest
 
-# ---------------- LOGGING (Error Tracking) ----------------
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -45,11 +47,9 @@ DB_PATH = "maharaja_bot.db"
 
 CHOOSE_BROKER, ASK_CLIENT_ID, ASK_SCREENSHOT = range(3)
 COOLDOWN_SECONDS = 120
-
-# Global Lock: If True, user approved once cannot submit again anywhere
 ONE_TIME_VERIFICATION = False
 
-# Commands
+# Commands List
 USER_COMMANDS = [
     ("start", "Start verification flow"),
     ("help", "Show help / command list"),
@@ -69,11 +69,25 @@ ADMIN_COMMANDS = [
     ("refreshcommands", "Refresh menu"),
 ]
 
+# ---------------- RENDER KEEP-ALIVE (IMPORTANT) ----------------
+# This Dummy Server prevents Render from killing the bot
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and running!")
+
+def start_web_server():
+    # Render provides PORT env variable, default to 10000
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    print(f"🌍 Dummy Web Server started on port {port}")
+    server.serve_forever()
+
 # ---------------- ASYNC DB MANAGER ----------------
-# Using aiosqlite to prevent blocking the event loop under load
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL;")  # High concurrency mode
+        await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 tg_user_id INTEGER PRIMARY KEY,
@@ -109,14 +123,12 @@ async def init_db():
                 reason TEXT
             )
         """)
-        # Indexes for speed
         await db.execute("CREATE INDEX IF NOT EXISTS idx_sub_user ON submissions(tg_user_id);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_sub_status ON submissions(status);")
         for b in BROKERS:
             await db.execute("INSERT OR IGNORE INTO vip_links (broker, invite_link) VALUES (?, NULL)", (b,))
         await db.commit()
 
-# Helper to get DB connection easily
 def get_db():
     return aiosqlite.connect(DB_PATH)
 
@@ -142,16 +154,14 @@ def approval_keyboard(sid: int) -> InlineKeyboardMarkup:
 async def show_typing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
     try:
         await ctx.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    except Exception:
-        pass
+    except Exception: pass
 
 async def notify_admins(ctx: ContextTypes.DEFAULT_TYPE, text: str, markup=None):
     admins = [x.strip() for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
     for a in admins:
         try:
             await ctx.bot.send_message(int(a), text, reply_markup=markup)
-        except Exception as e:
-            logger.warning(f"Failed to notify admin {a}: {e}")
+        except Exception: pass
 
 async def user_has_approved(user_id: int, broker: Optional[str] = None) -> bool:
     async with get_db() as db:
@@ -169,8 +179,7 @@ async def send_vip_link(ctx: ContextTypes.DEFAULT_TYPE, user_id: int, broker: st
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT invite_link FROM vip_links WHERE broker=?", (broker,)) as cursor:
             row = await cursor.fetchone()
-            if row:
-                link = row["invite_link"]
+            if row: link = row["invite_link"]
     
     if link:
         msg = f"🎉 *Congratulations! You are verified.*\nBroker: {broker}\n\n[Join VIP Channel]({link})"
@@ -179,15 +188,12 @@ async def send_vip_link(ctx: ContextTypes.DEFAULT_TYPE, user_id: int, broker: st
     
     try:
         await ctx.bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN)
-    except Forbidden:
-        logger.error(f"Cannot send link to {user_id}: Bot was blocked.")
     except Exception as e:
         logger.error(f"Error sending link to {user_id}: {e}")
 
 def normalize_client_id(broker: str, cid: str) -> Optional[str]:
     cid = (cid or "").strip()
-    if not cid:
-        return None
+    if not cid: return None
     if broker in ("Exness", "FBS"):
         return cid if re.fullmatch(r"\d{6,12}", cid) else None
     if broker == "IC Markets":
@@ -199,8 +205,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     chat_id = update.effective_chat.id
 
-    if await is_banned(u.id):
-        return 
+    if await is_banned(u.id): return 
 
     async with get_db() as db:
         await db.execute(
@@ -210,14 +215,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await db.commit()
 
-    # Set commands for user locally
     try:
         cmds = [BotCommand(n, d) for n, d in USER_COMMANDS]
         if is_admin(u.id):
             cmds += [BotCommand(n, d) for n, d in ADMIN_COMMANDS]
         await context.bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id))
-    except Exception:
-        pass
+    except Exception: pass
 
     await update.message.reply_text("Choose your Forex broker:", reply_markup=broker_keyboard())
     return CHOOSE_BROKER
@@ -229,8 +232,7 @@ async def on_broker_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["broker"] = broker
     u = update.effective_user
 
-    if await is_banned(u.id):
-        return await q.message.reply_text("🚫 Banned.")
+    if await is_banned(u.id): return await q.message.reply_text("🚫 Banned.")
 
     if await user_has_approved(u.id, broker):
         return await q.message.reply_text(f"✅ You are already verified for {broker}.")
@@ -261,7 +263,7 @@ async def on_client_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     now = int(time.time())
     if now - last_ts < COOLDOWN_SECONDS:
-        return await update.message.reply_text(f"⏳ Please wait {COOLDOWN_SECONDS - (now - last_ts)}s before submitting again.")
+        return await update.message.reply_text(f"⏳ Please wait {COOLDOWN_SECONDS - (now - last_ts)}s.")
 
     context.user_data["client_id"] = client_id
     await update.message.reply_text(
@@ -289,7 +291,6 @@ async def on_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (u.id, broker, client_id, file_id),
         )
         await db.execute("UPDATE users SET last_submit_ts=? WHERE tg_user_id=?", (int(time.time()), u.id))
-        
         async with db.execute("SELECT last_insert_rowid()") as cursor:
             sub_id = (await cursor.fetchone())[0]
         await db.commit()
@@ -300,7 +301,6 @@ async def on_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardRemove()
     )
 
-    # Notify Admins
     admin_text = (
         f"🔔 **New Request #{sub_id}**\n"
         f"User: {u.full_name} [ID: {u.id}]\n"
@@ -322,9 +322,7 @@ async def on_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_decide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    
-    if not is_admin(update.effective_user.id):
-        return
+    if not is_admin(update.effective_user.id): return
         
     action, sid = q.data.split(":", 1)
     sid = int(sid)
@@ -334,8 +332,7 @@ async def on_decide(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with db.execute("SELECT * FROM submissions WHERE id=?", (sid,)) as cursor:
             sub = await cursor.fetchone()
             
-        if not sub:
-            return await q.edit_message_text("❌ Submission not found/deleted.")
+        if not sub: return await q.edit_message_text("❌ Submission not found.")
             
         if action == "approve":
             await db.execute("UPDATE submissions SET status='approved', updated_at=CURRENT_TIMESTAMP WHERE id=?", (sid,))
@@ -347,19 +344,16 @@ async def on_decide(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db.commit()
             await q.edit_message_text(f"⛔ Rejected #{sid}.")
             try:
-                await context.bot.send_message(sub["tg_user_id"], "❌ Your verification request was rejected. Check details and resubmit.")
+                await context.bot.send_message(sub["tg_user_id"], "❌ Your verification was rejected.")
             except Exception: pass
 
 # ---------------- ADMIN COMMANDS ----------------
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     msg = " ".join(context.args).strip()
-    if not msg:
-        return await update.message.reply_text("Usage: /broadcast <message>")
+    if not msg: return await update.message.reply_text("Usage: /broadcast <message>")
     
-    await update.message.reply_text(f"📢 Starting broadcast... (This happens in background)")
-    
-    # Non-blocking broadcast
+    await update.message.reply_text(f"📢 Starting broadcast in background...")
     asyncio.create_task(run_broadcast(context, msg, update.effective_user.id))
 
 async def run_broadcast(context, msg, admin_id):
@@ -368,42 +362,33 @@ async def run_broadcast(context, msg, admin_id):
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT tg_user_id FROM users") as cursor:
             async for row in cursor:
-                uid = row["tg_user_id"]
                 try:
-                    await context.bot.send_message(uid, msg)
+                    await context.bot.send_message(row["tg_user_id"], msg)
                     sent += 1
-                    await asyncio.sleep(0.05) # Rate limit protection (20 msgs/sec)
-                except Forbidden:
-                    blocked += 1
-                except Exception as e:
-                    failed += 1
-                    logger.error(f"Broadcast fail for {uid}: {e}")
+                    await asyncio.sleep(0.05) 
+                except Forbidden: blocked += 1
+                except Exception: failed += 1
     
     try:
-        await context.bot.send_message(admin_id, f"📢 **Broadcast Report**\n✅ Sent: {sent}\n🚫 Blocked: {blocked}\n❌ Failed: {failed}", parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(admin_id, f"📢 **Broadcast Done**\n✅ Sent: {sent}\n🚫 Blocked: {blocked}\n❌ Failed: {failed}", parse_mode=ParseMode.MARKDOWN)
     except: pass
 
 async def cmd_exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Replaces Excel with CSV for Low RAM Usage
     if not is_admin(update.effective_user.id): return
-    
     await show_typing(context, update.effective_chat.id)
     filename = "export_users.csv"
     
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
-        
-        # Write to disk line-by-line (RAM Safe)
         with open(filename, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(["ID", "User ID", "Broker", "Client ID", "Status", "Created At"])
-            
             async with db.execute("SELECT id, tg_user_id, broker, client_id, status, created_at FROM submissions ORDER BY created_at DESC") as cursor:
                 async for row in cursor:
                     writer.writerow([row['id'], row['tg_user_id'], row['broker'], row['client_id'], row['status'], row['created_at']])
 
     await context.bot.send_document(update.effective_chat.id, document=open(filename, 'rb'), caption="✅ Data Export (CSV)")
-    os.remove(filename) # Cleanup
+    os.remove(filename)
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
@@ -413,13 +398,11 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = (await (await db.execute("SELECT COUNT(*) c FROM submissions WHERE status='pending'")).fetchone())['c']
     await update.message.reply_text(f"📊 **Stats**\nUsers: {users}\nPending Requests: {pending}", parse_mode=ParseMode.MARKDOWN)
 
-# Admin utility shortcuts (Keeping basic ones)
 async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id) or len(context.args) < 2: return
     broker = context.args[0]
     link = context.args[1]
     if broker not in BROKERS: return await update.message.reply_text(f"Invalid broker. Use: {BROKERS}")
-    
     async with get_db() as db:
         await db.execute("INSERT INTO vip_links (broker, invite_link) VALUES (?,?) ON CONFLICT(broker) DO UPDATE SET invite_link=excluded.invite_link", (broker, link))
         await db.commit()
@@ -436,12 +419,11 @@ def main():
         print("❌ Error: BOT_TOKEN is missing.")
         return
 
-    # Async Loop Policy fix for Windows (if testing locally)
-    # if os.name == 'nt': asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Start Dummy Web Server in Background Thread
+    threading.Thread(target=start_web_server, daemon=True).start()
 
     app = Application.builder().token(token).build()
 
-    # Init DB Loop
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
 
@@ -462,7 +444,7 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
 
-    print("✅ Bot is running efficiently...")
+    print("✅ Bot is running with Render Fix...")
     app.run_polling()
 
 if __name__ == "__main__":
