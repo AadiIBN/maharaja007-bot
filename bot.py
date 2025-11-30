@@ -1,4 +1,4 @@
-# bot.py — Verified Users Only for AI + Render Fix (English Version)
+# bot.py — Auto-Approval + Auto-Kick + Data Export + Admin Link Management
 # Python 3.10+ | python-telegram-bot 21.x | aiosqlite | google-generativeai
 
 import os
@@ -6,19 +6,19 @@ import re
 import time
 import asyncio
 import logging
-import csv
 import threading
 import aiosqlite
+import requests
+import datetime
+import pytz
+import csv
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional
-from io import BytesIO
+from io import BytesIO, StringIO
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     BotCommand,
     BotCommandScopeChat,
@@ -33,7 +33,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import Forbidden
+from telegram.error import BadRequest, Forbidden
 
 # --- IMPORT AI MODULE ---
 from ssm_ai import analyze_ssm_request
@@ -44,72 +44,65 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- CONFIG ----------------
-BROKERS = ["Exness", "IC Markets", "FBS"]
+# ---------------- CONFIGURATION ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+XM_TOKEN = os.getenv("XM_TOKEN")
+VANTAGE_USER_ID = os.getenv("VANTAGE_USER_ID")
+VANTAGE_SECRET = os.getenv("VANTAGE_SECRET")
+VIP_CHANNEL_ID = os.getenv("VIP_CHANNEL_ID") 
+ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "").split(",") if a.strip()] if os.getenv("ADMIN_IDS") else []
+
+BROKERS = ["XM", "Vantage"]
 DB_PATH = "maharaja_bot.db"
 
-# Conversation States
-CHOOSE_BROKER, ASK_CLIENT_ID, ASK_SCREENSHOT = range(3)
-COOLDOWN_SECONDS = 120
-ONE_TIME_VERIFICATION = False
+# States
+CHOOSE_BROKER, ASK_CLIENT_ID = range(2)
 
-# Commands List
+# Commands
 USER_COMMANDS = [
-    ("start", "Start verification flow"),
-    ("help", "Show help / command list"),
-    ("cancel", "Cancel verification"),
+    ("start", "Start verification"),
+    ("ai", "Use AI Mentor"),
+    ("help", "Show help"),
 ]
 ADMIN_COMMANDS = [
-    ("setgroup", "Set VIP link: /setgroup <broker> <link>"),
-    ("brokers", "List brokers & links"),
-    ("users", "Show users summary"),
-    ("pending", "List pending submissions"),
-    ("find", "Find by user/client ID"),
+    ("setgroup", "Set VIP Link: /setgroup <Broker> <Link>"),
+    ("kick_inactive", "Run 15-day kick check"),
+    ("export_data", "Download User Data (CSV)"),
     ("stats", "Show stats"),
-    ("ban", "Ban user"),
-    ("unban", "Unban user"),
-    ("broadcast", "Send msg to all users"),
-    ("exportcsv", "Export Data (Lightweight)"),
-    ("refreshcommands", "Refresh menu"),
+    ("broadcast", "Msg to all"),
 ]
 
 # ---------------- RENDER KEEP-ALIVE ----------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is alive and running!")
+        self.wfile.write(b"Bot is alive!")
 
 def start_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    print(f"🌍 Dummy Web Server started on port {port}")
     server.serve_forever()
 
-# ---------------- ASYNC DB MANAGER ----------------
+# ---------------- DATABASE ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 tg_user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_submit_ts INTEGER DEFAULT 0
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # last_trade_date format: YYYY-MM-DD
         await db.execute("""
             CREATE TABLE IF NOT EXISTS submissions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_user_id INTEGER NOT NULL,
-                broker TEXT NOT NULL,
-                client_id TEXT NOT NULL,
-                screenshot_file_id TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                tg_user_id INTEGER,
+                broker TEXT,
+                client_id TEXT,
+                status TEXT,
+                last_trade_date TEXT, 
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await db.execute("""
@@ -118,434 +111,327 @@ async def init_db():
                 invite_link TEXT
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS bans (
-                tg_user_id INTEGER PRIMARY KEY,
-                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                reason TEXT
-            )
-        """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_sub_user ON submissions(tg_user_id);")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_sub_status ON submissions(status);")
-        for b in BROKERS:
-            await db.execute("INSERT OR IGNORE INTO vip_links (broker, invite_link) VALUES (?, NULL)", (b,))
         await db.commit()
 
 def get_db():
     return aiosqlite.connect(DB_PATH)
 
-# ---------------- HELPERS ----------------
-def is_admin(user_id: int) -> bool:
-    admins = [a.strip() for a in os.getenv("ADMIN_IDS", "").split(",") if a.strip()]
-    return str(user_id) in admins
+# ---------------- VERIFICATION LOGIC ----------------
 
-async def is_banned(user_id: int) -> bool:
-    async with get_db() as db:
-        async with db.execute("SELECT 1 FROM bans WHERE tg_user_id=?", (user_id,)) as cursor:
-            return bool(await cursor.fetchone())
-
-# Check if user is verified (Has ANY approved submission)
-async def is_verified_user(user_id: int) -> bool:
-    async with get_db() as db:
-        async with db.execute("SELECT 1 FROM submissions WHERE tg_user_id=? AND status='approved' LIMIT 1", (user_id,)) as cursor:
-            return bool(await cursor.fetchone())
-
-def broker_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(b, callback_data=f"broker:{b}")] for b in BROKERS])
-
-def approval_keyboard(sid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve:{sid}"),
-        InlineKeyboardButton("⛔ Reject",  callback_data=f"reject:{sid}")
-    ]])
-
-async def show_typing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def verify_xm_user(client_id):
+    if not XM_TOKEN: return False
+    url = f"https://mypartners.xm.com/api/traders/{client_id}"
+    headers = {"Authorization": f"Bearer {XM_TOKEN}", "Content-Type": "application/json"}
     try:
-        await ctx.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    except Exception: pass
-
-async def notify_admins(ctx: ContextTypes.DEFAULT_TYPE, text: str, markup=None):
-    admins = [x.strip() for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-    for a in admins:
-        try:
-            await ctx.bot.send_message(int(a), text, reply_markup=markup)
-        except Exception: pass
-
-async def user_has_approved(user_id: int, broker: Optional[str] = None) -> bool:
-    async with get_db() as db:
-        if ONE_TIME_VERIFICATION:
-            async with db.execute("SELECT 1 FROM submissions WHERE tg_user_id=? AND status='approved' LIMIT 1", (user_id,)) as cursor:
-                return bool(await cursor.fetchone())
-        if broker is None:
-            return False
-        async with db.execute("SELECT 1 FROM submissions WHERE tg_user_id=? AND broker=? AND status='approved' LIMIT 1", (user_id, broker)) as cursor:
-            return bool(await cursor.fetchone())
-
-async def send_vip_link(ctx: ContextTypes.DEFAULT_TYPE, user_id: int, broker: str):
-    link = None
-    async with get_db() as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT invite_link FROM vip_links WHERE broker=?", (broker,)) as cursor:
-            row = await cursor.fetchone()
-            if row: link = row["invite_link"]
-    
-    # --- UPDATED SUCCESS MESSAGE (ENGLISH) ---
-    if link:
-        msg = (
-            f"🎉 *Congratulations! You are verified.*\n"
-            f"Broker: {broker}\n\n"
-            f"✅ **VIP Access Granted:**\n"
-            f"[Join VIP Channel]({link})\n\n"
-            f"🔓 **BONUS UNLOCKED:**\n"
-            f"**Shaakuni AI Mentor** is now active! 🤖\n"
-            f"You can send me any **Chart (Photo)** or **Question**, and I will analyze it using deep SSM logic.\n\n"
-            f"Try it now: Send a chart!"
-        )
-    else:
-        msg = (
-            f"🎉 *Congratulations! You are verified.*\n"
-            f"Broker: {broker}\n\n"
-            f"(VIP link is being updated by admin. Please wait.)\n\n"
-            f"🔓 **BONUS UNLOCKED:**\n"
-            f"**Shaakuni AI Mentor** is now active!\n"
-            f"You can start sending charts for analysis."
-        )
-    
-    try:
-        await ctx.bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN)
+        response = requests.get(url, headers=headers, timeout=10)
+        return response.status_code == 200
     except Exception as e:
-        logger.error(f"Error sending link to {user_id}: {e}")
+        logger.error(f"XM Error: {e}")
+        return False
 
-def normalize_client_id(broker: str, cid: str) -> Optional[str]:
-    cid = (cid or "").strip()
-    if not cid: return None
-    if broker in ("Exness", "FBS"):
-        return cid if re.fullmatch(r"\d{6,12}", cid) else None
-    if broker == "IC Markets":
-        return cid if re.fullmatch(r"[A-Za-z0-9_-]{5,16}", cid) else None
-    return cid
+async def verify_vantage_user(client_id):
+    if not VANTAGE_USER_ID or not VANTAGE_SECRET: return False
+    url = "https://openapi.vantagemarkets.com/api/ibData/accountData"
+    now = datetime.datetime.now()
+    end_time = now.strftime("%Y-%m-%d %H:%M:%S")
+    start_time = (now - datetime.timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+    
+    payload = {
+        "userId": int(VANTAGE_USER_ID),
+        "secret": VANTAGE_SECRET,
+        "startTime": start_time,
+        "endTime": end_time
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        data = response.json()
+        if data.get("code") == 1:
+            for acc in data.get("data", []):
+                if str(acc.get("account")) == str(client_id):
+                    return True
+        return False
+    except Exception as e:
+        logger.error(f"Vantage Error: {e}")
+        return False
 
-# ---------------- USER FLOW (VERIFICATION) ----------------
+# ---------------- INACTIVITY & KICK LOGIC ----------------
+
+async def update_trade_dates_and_kick(context: ContextTypes.DEFAULT_TYPE):
+    if not VIP_CHANNEL_ID:
+        logger.warning("VIP_CHANNEL_ID not set. Cannot kick users.")
+        return
+
+    logger.info("⏳ Starting Inactivity Check...")
+    
+    active_clients_map = {} 
+    
+    if VANTAGE_USER_ID and VANTAGE_SECRET:
+        url = "https://openapi.vantagemarkets.com/api/ibData/commissionData"
+        try:
+            payload = {"userId": int(VANTAGE_USER_ID), "secret": VANTAGE_SECRET}
+            response = requests.post(url, json=payload, timeout=20)
+            data = response.json()
+            
+            if data.get("code") == 1:
+                for record in data.get("data", []):
+                    c_id = str(record.get("account"))
+                    trade_time_str = record.get("last Trade Time")
+                    
+                    if trade_time_str:
+                        try:
+                            t_date = datetime.datetime.strptime(str(trade_time_str), "%Y-%m-%d %H:%M:%S").date()
+                            active_clients_map[c_id] = t_date
+                        except:
+                            pass 
+        except Exception as e:
+            logger.error(f"Failed to fetch Vantage Trade Data: {e}")
+
+    async with get_db() as db:
+        async with db.execute("SELECT tg_user_id, client_id, last_trade_date FROM submissions WHERE broker='Vantage' AND status='approved'") as cursor:
+            users = await cursor.fetchall()
+            
+        today = datetime.date.today()
+        
+        for u in users:
+            tg_id, client_id, db_last_trade = u
+            latest_trade_date = None
+            
+            if client_id in active_clients_map:
+                latest_trade_date = active_clients_map[client_id]
+                await db.execute("UPDATE submissions SET last_trade_date=? WHERE client_id=?", (str(latest_trade_date), client_id))
+            elif db_last_trade:
+                try:
+                    latest_trade_date = datetime.datetime.strptime(db_last_trade, "%Y-%m-%d").date()
+                except: pass
+
+            if latest_trade_date:
+                days_inactive = (today - latest_trade_date).days
+                if days_inactive > 15:
+                    try:
+                        await context.bot.ban_chat_member(chat_id=VIP_CHANNEL_ID, user_id=tg_id)
+                        await context.bot.unban_chat_member(chat_id=VIP_CHANNEL_ID, user_id=tg_id)
+                        await db.execute("UPDATE submissions SET status='kicked_inactive' WHERE client_id=?", (client_id,))
+                        try:
+                            await context.bot.send_message(
+                                chat_id=tg_id, 
+                                text=f"⚠️ **Alert:** Aapko VIP Group se remove kar diya gaya hai kyunki aapne pichle **{days_inactive} dinon** se trade nahi kiya.\n\nDobara join karne ke liye trading start karein aur `/start` dabayein."
+                            )
+                        except: pass
+                        logger.info(f"Kicked User {tg_id} (Inactive {days_inactive} days)")
+                    except Exception as e:
+                        logger.error(f"Cannot kick {tg_id}: {e}")
+        
+        await db.commit()
+    logger.info("Inactivity Check Complete.")
+
+# ---------------- COMMANDS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    chat_id = update.effective_chat.id
-
-    if await is_banned(u.id): return 
-
+    user = update.effective_user
+    
     async with get_db() as db:
         await db.execute(
-            "INSERT INTO users (tg_user_id, username, first_name, last_name) VALUES (?,?,?,?) "
-            "ON CONFLICT(tg_user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name, last_name=excluded.last_name",
-            (u.id, u.username, u.first_name, u.last_name),
+            "INSERT OR IGNORE INTO users (tg_user_id, username) VALUES (?,?)",
+            (user.id, user.username)
         )
         await db.commit()
 
-    try:
-        cmds = [BotCommand(n, d) for n, d in USER_COMMANDS]
-        if is_admin(u.id):
-            cmds += [BotCommand(n, d) for n, d in ADMIN_COMMANDS]
-        await context.bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id))
-    except Exception: pass
-
-    await update.message.reply_text("Choose your Forex broker:", reply_markup=broker_keyboard())
+    keyboard = [[InlineKeyboardButton(b, callback_data=f"broker:{b}")] for b in BROKERS]
+    
+    await update.message.reply_text(
+        f"👋 **Namaste {user.first_name}!**\n\n"
+        "Maharaja VIP Club Access & AI Mentor.\n"
+        "Select your Broker to verify:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
     return CHOOSE_BROKER
 
 async def on_broker_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, broker = q.data.split(":", 1)
+    query = update.callback_query
+    await query.answer()
+    broker = query.data.split(":")[1]
     context.user_data["broker"] = broker
-    u = update.effective_user
-
-    if await is_banned(u.id): return await q.message.reply_text("🚫 Banned.")
-
-    if await user_has_approved(u.id, broker):
-        return await q.message.reply_text(f"✅ You are already verified for {broker}.")
-
-    async with get_db() as db:
-        async with db.execute("SELECT 1 FROM submissions WHERE tg_user_id=? AND broker=? AND status='pending'", (u.id, broker)) as cursor:
-            if await cursor.fetchone():
-                return await q.message.reply_text(f"⏳ You already have a pending request for {broker}.")
-
-    await q.message.reply_text(f"You selected: **{broker}**\n👉 Enter your Client ID / Account ID:", parse_mode=ParseMode.MARKDOWN)
+    await query.message.reply_text(f"👉 Enter your **{broker} Account ID**:", parse_mode=ParseMode.MARKDOWN)
     return ASK_CLIENT_ID
 
 async def on_client_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if await is_banned(u.id): return
-
+    user_id = update.effective_user.id
+    client_id = update.message.text.strip()
     broker = context.user_data.get("broker")
-    client_id = normalize_client_id(broker, (update.message.text or "").strip())
+
+    if not client_id.isdigit():
+        await update.message.reply_text("❌ Numbers only.")
+        return ASK_CLIENT_ID
+
+    status_msg = await update.message.reply_text("🔄 Verifying...", parse_mode=ParseMode.MARKDOWN)
     
-    if not client_id:
-        return await update.message.reply_text(f"❌ Invalid ID format for {broker}. Try again.")
-
-    async with get_db() as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT last_submit_ts FROM users WHERE tg_user_id=?", (u.id,)) as cursor:
-            row = await cursor.fetchone()
-            last_ts = row["last_submit_ts"] if row else 0
-
-    now = int(time.time())
-    if now - last_ts < COOLDOWN_SECONDS:
-        return await update.message.reply_text(f"⏳ Please wait {COOLDOWN_SECONDS - (now - last_ts)}s.")
-
-    context.user_data["client_id"] = client_id
-    await update.message.reply_text(
-        "📸 (Optional) Send deposit screenshot now, or tap 'Skip'.",
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Skip")]], resize_keyboard=True, one_time_keyboard=True)
-    )
-    return ASK_SCREENSHOT
-
-async def on_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if await is_banned(u.id): return
-
-    file_id = None
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-    elif update.message.text and update.message.text.lower() != "skip":
-        return await update.message.reply_text("Please send a photo or tap Skip.")
-
-    broker = context.user_data.get("broker")
-    client_id = context.user_data.get("client_id")
-
-    async with get_db() as db:
-        await db.execute(
-            "INSERT INTO submissions (tg_user_id, broker, client_id, screenshot_file_id, status) VALUES (?,?,?,?, 'pending')",
-            (u.id, broker, client_id, file_id),
-        )
-        await db.execute("UPDATE users SET last_submit_ts=? WHERE tg_user_id=?", (int(time.time()), u.id))
-        async with db.execute("SELECT last_insert_rowid()") as cursor:
-            sub_id = (await cursor.fetchone())[0]
-        await db.commit()
-
-    await update.message.reply_text(
-        "✅ **Submitted!**\nWe will notify you after admin review.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-    admin_text = (
-        f"🔔 **New Request #{sub_id}**\n"
-        f"User: {u.full_name} [ID: {u.id}]\n"
-        f"Broker: {broker}\n"
-        f"Client ID: `{client_id}`\n"
-    )
-    await notify_admins(context, admin_text, approval_keyboard(sub_id))
+    is_valid = False
+    if broker == "XM":
+        is_valid = await verify_xm_user(client_id)
+    elif broker == "Vantage":
+        is_valid = await verify_vantage_user(client_id)
     
-    if file_id:
-        admins = [x.strip() for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-        for a in admins:
-            try:
-                await context.bot.send_photo(int(a), file_id, caption=f"Screenshot for #{sub_id}")
-            except Exception: pass
-
-    return ConversationHandler.END
-
-# ---------------- NEW AI MENTOR HANDLER (LOCKED FOR NON-VERIFIED) ----------------
-async def handle_mentorship(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles Photos (Charts) and Text questions.
-    LOCKS feature if user is not verified.
-    """
-    u = update.effective_user
-    if await is_banned(u.id): return
-
-    # --- 1. CHECK VERIFICATION STATUS ---
-    is_verified = await is_verified_user(u.id)
-
-    if not is_verified:
-        # USER NOT VERIFIED -> REJECT REQUEST (ENGLISH)
+    if is_valid:
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        async with get_db() as db:
+            await db.execute("DELETE FROM submissions WHERE client_id=? AND broker=?", (client_id, broker)) 
+            await db.execute(
+                "INSERT INTO submissions (tg_user_id, broker, client_id, status, last_trade_date) VALUES (?,?,?, 'approved', ?)",
+                (user_id, broker, client_id, today_str)
+            )
+            await db.commit()
+        
+        vip_link = None
+        async with get_db() as db:
+            async with db.execute("SELECT invite_link FROM vip_links WHERE broker=?", (broker,)) as cursor:
+                row = await cursor.fetchone()
+                if row: vip_link = row[0]
+        
         msg = (
-            "🔒 **Premium Feature Locked**\n\n"
-            "Sorry, **Shaakuni AI Mentor** is exclusively for verified VIP members.\n\n"
-            "👉 **How to unlock?**\n"
-            "1. Tap /start.\n"
-            "2. Select your Broker and verify your account.\n"
-            "3. Once approved by Admin, this feature will unlock automatically."
+            f"🎉 **Verified!**\n"
+            f"✅ Broker: {broker}\n\n"
+            f"🔗 **VIP Link:**\n{vip_link if vip_link else 'Link coming soon...'}\n\n"
+            f"⚠️ **Note:** Active trading is required. **15 days inactivity = Auto Kick.**\n\n"
+            f"🔓 **AI Mentor Unlocked!** Send me charts anytime."
         )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+    else:
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text="❌ Verification Failed. ID not found under our IB.", parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+
+# ---------------- AI HANDLER ----------------
+async def handle_mentorship(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    is_verified = False
+    async with get_db() as db:
+        async with db.execute("SELECT 1 FROM submissions WHERE tg_user_id=? AND status='approved' LIMIT 1", (user_id,)) as cursor:
+            if await cursor.fetchone(): is_verified = True
+            
+    if not is_verified:
+        await update.message.reply_text("🔒 Locked. Verify first.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # --- 2. USER IS VERIFIED -> PROCEED WITH AI ---
-    # Check if we have a photo or text
     image_bytes = None
     user_text = update.message.caption or update.message.text
+    if not user_text and not image_bytes and not update.message.photo: return
 
-    # Notify user we are thinking (English)
-    status_msg = await update.message.reply_text("🧠 Analyzing Shaakuni Strategy... Please wait.")
+    status_msg = await update.message.reply_text("🧠 Analyzing...")
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
     try:
-        # If user sent a photo
         if update.message.photo:
             photo_file = await update.message.photo[-1].get_file()
-            # Download to memory
             image_stream = BytesIO()
             await photo_file.download_to_memory(image_stream)
             image_bytes = image_stream.getvalue()
         
-        # Call AI
         response = await analyze_ssm_request(user_text, image_bytes)
-
-        # Reply (Use Markdown for formatting)
         try:
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=status_msg.message_id,
-                text=response,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception:
-            # Fallback if Markdown fails
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=status_msg.message_id,
-                text=response
-            )
-
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=response, parse_mode=ParseMode.MARKDOWN)
+        except:
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=response)
     except Exception as e:
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=status_msg.message_id,
-            text=f"❌ Error during analysis: {str(e)}"
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"⚠️ Error: {str(e)}")
 
-# ---------------- ADMIN ACTIONS ----------------
-async def on_decide(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(update.effective_user.id): return
-        
-    action, sid = q.data.split(":", 1)
-    sid = int(sid)
-    
-    async with get_db() as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM submissions WHERE id=?", (sid,)) as cursor:
-            sub = await cursor.fetchone()
-            
-        if not sub: return await q.edit_message_text("❌ Submission not found.")
-            
-        if action == "approve":
-            await db.execute("UPDATE submissions SET status='approved', updated_at=CURRENT_TIMESTAMP WHERE id=?", (sid,))
-            await db.commit()
-            await q.edit_message_text(f"✅ Approved #{sid} (User notified).")
-            # Send VIP link + Unlock Notification
-            await send_vip_link(context, sub["tg_user_id"], sub["broker"])
-        else:
-            await db.execute("UPDATE submissions SET status='rejected', updated_at=CURRENT_TIMESTAMP WHERE id=?", (sid,))
-            await db.commit()
-            await q.edit_message_text(f"⛔ Rejected #{sid}.")
-            try:
-                await context.bot.send_message(sub["tg_user_id"], "❌ Your verification was rejected.")
-            except Exception: pass
-
-# ---------------- ADMIN COMMANDS ----------------
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    msg = " ".join(context.args).strip()
-    if not msg: return await update.message.reply_text("Usage: /broadcast <message>")
-    
-    await update.message.reply_text(f"📢 Starting broadcast in background...")
-    asyncio.create_task(run_broadcast(context, msg, update.effective_user.id))
-
-async def run_broadcast(context, msg, admin_id):
-    sent, failed, blocked = 0, 0, 0
-    async with get_db() as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT tg_user_id FROM users") as cursor:
-            async for row in cursor:
-                try:
-                    await context.bot.send_message(row["tg_user_id"], msg)
-                    sent += 1
-                    await asyncio.sleep(0.05) 
-                except Forbidden: blocked += 1
-                except Exception: failed += 1
-    
-    try:
-        await context.bot.send_message(admin_id, f"📢 **Broadcast Done**\n✅ Sent: {sent}\n🚫 Blocked: {blocked}\n❌ Failed: {failed}", parse_mode=ParseMode.MARKDOWN)
-    except: pass
-
-async def cmd_exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    await show_typing(context, update.effective_chat.id)
-    filename = "export_users.csv"
-    
-    async with get_db() as db:
-        db.row_factory = aiosqlite.Row
-        with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(["ID", "User ID", "Broker", "Client ID", "Status", "Created At"])
-            async with db.execute("SELECT id, tg_user_id, broker, client_id, status, created_at FROM submissions ORDER BY created_at DESC") as cursor:
-                async for row in cursor:
-                    writer.writerow([row['id'], row['tg_user_id'], row['broker'], row['client_id'], row['status'], row['created_at']])
-
-    await context.bot.send_document(update.effective_chat.id, document=open(filename, 'rb'), caption="✅ Data Export (CSV)")
-    os.remove(filename)
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    async with get_db() as db:
-        db.row_factory = aiosqlite.Row
-        users = (await (await db.execute("SELECT COUNT(*) c FROM users")).fetchone())['c']
-        pending = (await (await db.execute("SELECT COUNT(*) c FROM submissions WHERE status='pending'")).fetchone())['c']
-    await update.message.reply_text(f"📊 **Stats**\nUsers: {users}\nPending Requests: {pending}", parse_mode=ParseMode.MARKDOWN)
+# ---------------- ADMIN COMMANDS (DATA EXPORT & LINK MANAGEMENT) ----------------
 
 async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id) or len(context.args) < 2: return
-    broker = context.args[0]
-    link = context.args[1]
-    if broker not in BROKERS: return await update.message.reply_text(f"Invalid broker. Use: {BROKERS}")
+    user_id = str(update.effective_user.id)
+    if user_id not in ADMIN_IDS: return
+    try:
+        broker = context.args[0]
+        link = context.args[1]
+        async with get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO vip_links (broker, invite_link) VALUES (?,?)", (broker, link))
+            await db.commit()
+        await update.message.reply_text(f"✅ Link set for {broker}")
+    except:
+        await update.message.reply_text("Usage: /setgroup <XM/Vantage> <Link>")
+
+async def cmd_export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Exports all submissions data to a CSV file and sends it to the admin.
+    """
+    user_id = str(update.effective_user.id)
+    if user_id not in ADMIN_IDS: return
+
+    await update.message.reply_text("⏳ Generating CSV file...")
+
     async with get_db() as db:
-        await db.execute("INSERT INTO vip_links (broker, invite_link) VALUES (?,?) ON CONFLICT(broker) DO UPDATE SET invite_link=excluded.invite_link", (broker, link))
-        await db.commit()
-    await update.message.reply_text(f"✅ Link set for {broker}")
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM submissions ORDER BY created_at DESC") as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await update.message.reply_text("❌ No data found.")
+        return
+
+    # Create CSV in memory
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    # Write Header (Column Names)
+    writer.writerow(rows[0].keys())
+    
+    # Write Data
+    for row in rows:
+        writer.writerow(tuple(row))
+    
+    output.seek(0)
+    
+    # Convert StringIO to BytesIO for sending as file
+    bytes_io = BytesIO(output.getvalue().encode('utf-8'))
+    bytes_io.name = f"maharaja_users_{int(time.time())}.csv"
+
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id, 
+        document=bytes_io, 
+        caption="✅ Here is the complete user data."
+    )
+
+async def cmd_kick_inactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id not in ADMIN_IDS: return
+    await update.message.reply_text("⏳ Running inactivity check...")
+    await update_trade_dates_and_kick(context)
+    await update.message.reply_text("✅ Check complete.")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-# ---------------- BOOT ----------------
+# ---------------- MAIN ----------------
 def main():
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        print("❌ Error: BOT_TOKEN is missing.")
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN missing")
         return
 
-    # Start Dummy Web Server in Background Thread
     threading.Thread(target=start_web_server, daemon=True).start()
-
-    app = Application.builder().token(token).build()
-
+    app = Application.builder().token(BOT_TOKEN).build()
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
 
-    # 1. Verification Conversation (Iska priority high hona chahiye)
+    if app.job_queue:
+        app.job_queue.run_daily(update_trade_dates_and_kick, time=datetime.time(hour=12, minute=0, tzinfo=pytz.UTC))
+        print("✅ Auto-Kick Job Scheduled.")
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             CHOOSE_BROKER: [CallbackQueryHandler(on_broker_choice, pattern=r"^broker:")],
             ASK_CLIENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_client_id)],
-            ASK_SCREENSHOT: [MessageHandler(filters.ALL, on_screenshot)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+
     app.add_handler(conv)
-
-    # 2. Admin Handlers
-    app.add_handler(CallbackQueryHandler(on_decide, pattern=r"^(approve|reject):"))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("exportcsv", cmd_exportcsv))
-    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
-
-    # 3. AI MENTOR HANDLER (Lowest Priority - For random chats/photos)
-    # Ye handler tabhi chalega jab upar wala Conversation active nahi hoga
+    app.add_handler(CommandHandler("kick_inactive", cmd_kick_inactive))
+    app.add_handler(CommandHandler("export_data", cmd_export_data))
     app.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), handle_mentorship))
 
-    print("✅ Bot is running with Shaakuni AI (Verified Only Mode)...")
+    print("✅ Maharaja Auto-Bot Started...")
     app.run_polling()
 
 if __name__ == "__main__":
