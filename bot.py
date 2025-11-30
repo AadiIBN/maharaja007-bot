@@ -1,5 +1,5 @@
 # bot.py — Verified Users Only for AI + Render Fix (English Version)
-# Python 3.10+ | python-telegram-bot 21.x | aiosqlite | openai
+# Python 3.10+ | python-telegram-bot 21.x | aiosqlite | google-generativeai
 
 import os
 import re
