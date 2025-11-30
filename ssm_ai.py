@@ -1,18 +1,24 @@
 import os
-import google.generativeai as genai
+from openai import OpenAI
+from io import BytesIO
+import base64
+import asyncio
 
 # --- CONFIGURATION ---
-# Render environment variables se API Key lega
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# Render environment variables se API Key lega (Ab naam OPENAI_API_KEY hoga)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Model Setup
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel('gemini-2.0-flash-exp')
+if OPENAI_API_KEY:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    # Vision model for chart analysis
+    AI_MODEL = 'gpt-4o-mini' 
 else:
-    model = None
+    client = None
+    AI_MODEL = None
 
 # --- SHAAKUNI ULTIMATE BIBLE (STRATEGY KNOWLEDGE BASE) ---
+# Ye knowledge base wahi rahegi, taki ChatGPT aapke rules ko follow kare.
 SSM_BIBLE = """
 # ==============================================================================
 # SHAAKUNI TRAP (SSM) - THE ULTIMATE ALGORITHMIC BIBLE
@@ -100,7 +106,7 @@ Your logic is STRICTLY governed by the following BIBLE:
 
 YOUR TASK:
 1. Analyze the user's CHART (Image) or QUESTION (Text).
-2. **DETECT LANGUAGE:** Identify the language the user is using (English, Hindi, Hinglish, etc.).
+2. **DETECT LANGUAGE:** Identify the language the user is using (English, Hindi, Hinglish, Spanish, etc.).
 3. **MATCH LANGUAGE:** Respond in the EXACT SAME language and tone as the user.
    - User: "Is this valid?" -> You: "This is valid because..." (English)
    - User: "Kya ye sahi hai?" -> You: "Haan, ye sahi hai kyunki..." (Hinglish)
@@ -115,34 +121,59 @@ YOUR TASK:
    - **Action:** (Give advice in USER'S LANGUAGE)
 """
 
+# Function to convert image bytes to base64 string
+def get_base64_image(image_bytes):
+    return base64.b64encode(image_bytes).decode("utf-8")
+
 async def analyze_ssm_request(user_text, image_bytes=None):
     """
-    Main function called by bot.py to interact with Gemini AI.
+    Main function called by bot.py to interact with OpenAI API.
     """
-    # 1. Check for API Key
-    if not GOOGLE_API_KEY:
-        return "❌ Error: Google API Key is missing. Please add GOOGLE_API_KEY in Render Environment Variables."
+    if not client:
+        return "❌ Error: OpenAI API Key is missing. Please add OPENAI_API_KEY in Render Environment Variables."
 
-    # 2. Check for Model Initialization
-    if not model:
-        return "❌ Error: AI Model failed to initialize. Please check your API Key."
+    # Convert image to base64 for API call
+    base64_image = None
+    if image_bytes:
+        base64_image = get_base64_image(image_bytes)
+
+    # --- Construct Message Content ---
+    prompt_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT}
+    ]
+    
+    user_content = []
+    
+    # 1. Add Text Prompt
+    user_content.append({"type": "text", "text": f"User Query: {user_text or 'Analyze the chart.'}"})
+    
+    # 2. Add Image if available
+    if base64_image:
+        user_content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{base64_image}",
+                "detail": "high"
+            }
+        })
+
+    prompt_messages.append({"role": "user", "content": user_content})
 
     try:
-        # 3. Process Request (Image or Text)
-        if image_bytes:
-            # CHART ANALYSIS MODE (Vision)
-            image_parts = [{"mime_type": "image/jpeg", "data": image_bytes}]
-            prompt_parts = [
-                SYSTEM_PROMPT, 
-                f"User Chart Caption: {user_text or 'Analyze this setup strictly'}.", 
-                image_parts[0]
-            ]
-            response = await model.generate_content_async(prompt_parts)
-        else:
-            # TEXT MODE (Q&A)
-            response = await model.generate_content_async([SYSTEM_PROMPT, f"Student Question: {user_text}"])
-            
-        return response.text
+        # Call the OpenAI API (Using sync call since analyze_ssm_request is called from an async handler)
+        loop = asyncio.get_event_loop()
+        
+        response = await loop.run_in_executor(None, lambda: client.chat.completions.create(
+            model=AI_MODEL,
+            messages=prompt_messages,
+            temperature=0.2,
+            max_tokens=1500
+        ))
+        
+        return response.choices[0].message.content
         
     except Exception as e:
-        return f"⚠️ AI Error: {str(e)}"
+        # Check if the error is due to a rate limit or invalid API key
+        if "rate limit" in str(e).lower() or "authentication" in str(e).lower():
+            return f"❌ API Authentication Error or Rate Limit Exceeded. Please check your OPENAI_API_KEY and billing details. Error: {str(e)}"
+        return f"⚠️ AI Processing Error: {str(e)}"
